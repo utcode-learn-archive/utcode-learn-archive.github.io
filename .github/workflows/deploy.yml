@@ -1,0 +1,205 @@
+name: Deploy Snapshots
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: 2 8 * * 4 # Every Thursday at 08:02 UTC
+
+concurrency:
+  group: deploy-snapshots
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  deploy-website:
+    name: Deploy website
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v5
+
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Checkout utcode-learn
+        uses: actions/checkout@v5
+        with:
+          repository: ut-code/utcode-learn
+          ref: main
+          path: source
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+
+      - name: Generate commits.json
+        run: node scripts/generate-commits-json.js
+        shell: bash
+
+      - name: Copy frontend files
+        run: cp -r frontend/. gh-pages
+        shell: bash
+
+      - name: Commit and push if changed
+        run: |
+          cd gh-pages
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .
+            git commit -m "Update website"
+            git push origin gh-pages
+          else
+            echo "No changes"
+          fi
+        shell: bash
+
+  filter-commits:
+    name: Filter Commits
+    needs: deploy-website
+    runs-on: ubuntu-latest
+    outputs:
+      commits: ${{ steps.read-commits.outputs.commits }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v5
+
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+
+      - name: Generate filtered-commits.json
+        run: node scripts/filter-commits.js
+        shell: bash
+
+      - name: Read filtered commits
+        id: read-commits
+        run: |
+          commits=$(cat filtered-commits.json)
+          echo "commits=$commits" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  deploy-snapshots:
+    name: Deploy Snapshots
+    needs: filter-commits
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        commit: ${{ fromJson(needs.filter-commits.outputs.commits) }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v5
+
+      - name: Checkout utcode-learn
+        uses: actions/checkout@v5
+        with:
+          repository: ut-code/utcode-learn
+          ref: main
+          path: source
+          fetch-depth: 0
+
+      - name: Checkout the commit
+        run: |
+          cd source
+          git checkout ${{ matrix.commit.commitHash }}
+        shell: bash
+
+      - name: Modify docusaurus.config.js to set baseUrl
+        run: |
+          sed -i 's|baseUrl: .*,|baseUrl: "/${{ matrix.commit.commitHash }}/",|' ./source/docusaurus.config.js
+        shell: bash
+
+      - name: Determine Node.js version
+        id: node-version
+        run: |
+          cd source
+          if [ -f .nvmrc ]; then
+            version=$(cat .nvmrc)
+          else
+            version=$(sed -n 's/.*"node": "[^0-9]*\([0-9][0-9]*\).*/\1/p' ./package.json)
+            if [ -z "$version" ]; then
+              version=16
+            fi
+          fi
+          echo "node-version=$version" >> "$GITHUB_OUTPUT"
+          echo "⚙️ Using Node.js version $version for commit ${{ matrix.commit.commitHash }}"
+        shell: bash
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+
+      - name: Install dependencies
+        run: |
+          cd source
+          if [ -f package-lock.json ]; then
+            echo "📦 Using npm as package manager"
+            npm ci
+          elif [ -f yarn.lock ]; then
+            echo "📦 Using yarn as package manager"
+            yarn install --frozen-lockfile
+          fi
+        shell: bash
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: |
+          cd source
+          if [ -f package-lock.json ]; then
+            npm run build 2>./../scripts/error/error-log.txt
+          elif [ -f yarn.lock ]; then
+            yarn build 2>./../scripts/error/error-log.txt
+          fi
+        shell: bash
+
+      - name: Copy build output
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p ./out
+          cp -r ./source/build/. ./out
+        shell: bash
+
+      - name: Copy error page
+        if: steps.build.outcome == 'failure'
+        run: |
+          mkdir -p ./out
+          cp -r ./scripts/error/. ./out
+        shell: bash
+
+      - name: Create README
+        run: |
+          echo "# Snapshot for commit ${{ matrix.commit.commitHash }}" > ./out/README.md
+          echo "" >> ./out/README.md
+          echo "This is an automatically generated snapshot for commit [${{ matrix.commit.commitHash }}](https://github.com/ut-code/utcode-learn/commit/${{ matrix.commit.commitHash }})" >> ./out/README.md
+
+      - name: Commit and push
+        env:
+          GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+        run: |
+          cd out
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b gh-pages
+          git add .
+          git commit -m "Add snapshot for commit ${{ matrix.commit.commitHash }}"
+          gh repo create utcode-learn-archive/${{ matrix.commit.commitHash }} --public
+          gh auth setup-git
+          git push https://github.com/utcode-learn-archive/${{ matrix.commit.commitHash }}.git gh-pages
+        shell: bash
